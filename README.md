@@ -1,8 +1,10 @@
 # POLYCADE
 
+[![ci](https://github.com/robotismo/polycade/actions/workflows/ci.yml/badge.svg)](https://github.com/robotismo/polycade/actions/workflows/ci.yml)
+
 Five low-poly arcade classics, reimagined in 3D and rendered with [three.js](https://threejs.org). One cohesive neon-on-dark product, playable on desktop and phone, with high scores that persist across reloads. Every game ships as its own lazily-loaded tab, so you only download the cabinet you open.
 
-**▶ Live:** _deploys to GitHub Pages via CI on every push to `main`_ — `https://<user>.github.io/<repo>/`
+**▶ Live: https://robotismo.github.io/polycade/** — deploys to GitHub Pages via CI on every push to `main`.
 
 ![POLYCADE home](docs/home.png)
 
