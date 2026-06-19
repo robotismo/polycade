@@ -1,0 +1,19 @@
+{
+  "name": "POLYCADE",
+  "short_name": "POLYCADE",
+  "description": "Five low-poly 3D arcade games in your browser.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#08080f",
+  "theme_color": "#08080f",
+  "icons": [
+    {
+      "src": "./icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
