@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import type { Game, GameEnv, GameFactory } from '../../engine/types';
 import { neon, surface, emissive } from '../../art/materials';
-import { addLightRig, applyAtmosphere } from '../../art/lighting';
+import { addLightRig, applyAtmosphere, addGradientBackdrop } from '../../art/lighting';
 import { accents, palette } from '../../art/tokens';
 import { Rng } from '../../engine/rng';
+import { Pool } from '../../engine/pool';
+import { disposeScene } from '../../engine/dispose';
 
 /**
  * RALLY — 3D Pong on a vertical court. The ball travels mostly up/down; the
@@ -30,6 +32,16 @@ const AI_SPEED = 7.6; // AI paddle cap — deliberately below ball so it's beata
 const AI_DEADZONE = 0.35; // AI ignores x-error smaller than this (gives the player gaps)
 const SPIN_FACTOR = 0.42; // how much paddle motion nudges the ball's vx
 const MAX_MISSES = 5;
+
+/** A short-lived cosmetic spark (visual only — never simulation). */
+interface Spark {
+  mesh: THREE.Mesh;
+  mat: THREE.MeshBasicMaterial;
+  vx: number;
+  vy: number;
+  life: number;
+  maxLife: number;
+}
 
 class Rally implements Game {
   readonly scene = new THREE.Scene();
@@ -66,6 +78,15 @@ class Rally implements Game {
   private serveDelay = 0; // brief freeze after a point, sim-stepped
   private glowT = 0;
 
+  // --- Juice (frame-only, never simulation) -----------------------------
+  /** Per-paddle scale-pop trauma [0..1], decays each frame. */
+  private playerPop = 0;
+  private aiPop = 0;
+  /** Pending visual events raised by update(), consumed/spawned in frame(). */
+  private fxQueue: { x: number; y: number; color: number; count: number }[] = [];
+  private sparks: Spark[] = [];
+  private sparkPool!: Pool<Spark>;
+
   // --- Meshes -----------------------------------------------------------
   private ballMesh!: THREE.Mesh;
   private playerMesh!: THREE.Mesh;
@@ -82,6 +103,7 @@ class Rally implements Game {
 
   init(_env: GameEnv): void {
     addLightRig(this.scene, palette.violet);
+    addGradientBackdrop(this.scene, accents.rally);
 
     // Court floor slab for depth.
     const floor = new THREE.Mesh(
@@ -142,6 +164,21 @@ class Rally implements Game {
     this.playerMesh.position.y = -PADDLE_Y;
     this.aiMesh.position.y = PADDLE_Y;
     this.scene.add(this.playerMesh, this.aiMesh);
+
+    // Pooled cosmetic sparks (visual only — recycled, never allocated mid-rally).
+    const sparkGeo = new THREE.IcosahedronGeometry(0.12, 0);
+    this.sparkPool = new Pool<Spark>({
+      create: () => {
+        const mat = new THREE.MeshBasicMaterial({ color: palette.ink, transparent: true });
+        const mesh = new THREE.Mesh(sparkGeo, mat);
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return { mesh, mat, vx: 0, vy: 0, life: 0, maxLife: 0 };
+      },
+      onAcquire: (s) => (s.mesh.visible = true),
+      onRelease: (s) => (s.mesh.visible = false),
+      prefill: 12,
+    });
   }
 
   reset(): void {
@@ -154,6 +191,12 @@ class Rally implements Game {
     this.prevAiX = 0;
     this.playerVelSmoothed = 0;
     this.serveDelay = 0;
+    // Clear any in-flight juice so a restart starts visually clean.
+    this.playerPop = 0;
+    this.aiPop = 0;
+    this.fxQueue.length = 0;
+    for (const s of this.sparks) this.sparkPool.release(s);
+    this.sparks.length = 0;
     this.serve(this.rng.next() < 0.5 ? -1 : 1);
     // Place meshes immediately so the first rendered frame is correct.
     this.syncMeshes();
@@ -242,10 +285,16 @@ class Rally implements Game {
       this.score += 1;
       env.setScore(this.score);
       env.audio.play('score');
+      // Juice: violet burst near the top goal on a player point.
+      env.shake(0.12);
+      this.fxQueue.push({ x: this.ball.x, y: HALF_H - 0.1, color: palette.violet, count: 10 });
       this.serve(-1); // next serve goes down toward the player
     } else if (this.ball.y < -HALF_H - BALL_R) {
       this.misses += 1;
       env.audio.play('crash');
+      // Juice: magenta burst near the bottom goal on a miss.
+      env.shake(0.22);
+      this.fxQueue.push({ x: this.ball.x, y: -HALF_H + 0.1, color: palette.magenta, count: 10 });
       if (this.misses >= MAX_MISSES) {
         this.alive = false;
         this.syncMeshes();
@@ -298,6 +347,13 @@ class Rally implements Game {
     }
 
     env.audio.play('bounce');
+
+    // --- Juice (no sim effect) ----------------------------------------
+    env.shake(0.06);
+    const contactColor = normalY > 0 ? accents.rally : palette.magenta;
+    if (normalY > 0) this.playerPop = 1;
+    else this.aiPop = 1;
+    this.fxQueue.push({ x: this.ball.x, y: faceY, color: contactColor, count: 6 });
   }
 
   /** Push simulation state onto meshes (called at end of each step). */
@@ -307,22 +363,73 @@ class Rally implements Game {
     this.aiMesh.position.x = this.aiX;
   }
 
-  frame(alpha: number, _env: GameEnv): void {
+  frame(alpha: number, env: GameEnv): void {
+    const dt = env.dt;
+
     // Interpolate the ball between fixed steps for buttery motion.
     const bx = this.prevBall.x + (this.ball.x - this.prevBall.x) * alpha;
     const by = this.prevBall.y + (this.ball.y - this.prevBall.y) * alpha;
     this.ballMesh.position.set(bx, by, 0);
-    this.ballMesh.rotation.x += 0.04;
-    this.ballMesh.rotation.y += 0.05;
+    // Frame-rate-independent cosmetic spin (was hardcoded 0.04 / 0.05 per frame).
+    this.ballMesh.rotation.x += dt * 2.4;
+    this.ballMesh.rotation.y += dt * 3.0;
 
     this.playerMesh.position.x =
       this.prevPlayerX + (this.playerX - this.prevPlayerX) * alpha;
     this.aiMesh.position.x = this.prevAiX + (this.aiX - this.prevAiX) * alpha;
 
+    // Paddle scale-pop on contact, decaying to rest over ~0.18s.
+    this.playerPop = Math.max(0, this.playerPop - dt * 5.5);
+    this.aiPop = Math.max(0, this.aiPop - dt * 5.5);
+    this.playerMesh.scale.set(1 + this.playerPop * 0.18, 1 + this.playerPop * 0.4, 1);
+    this.aiMesh.scale.set(1 + this.aiPop * 0.18, 1 + this.aiPop * 0.4, 1);
+
     // Subtle synchronized paddle glow pulse.
     const pulse = 0.9 + Math.sin(this.glowT * 4) * 0.18;
     this.playerMat.emissiveIntensity = pulse;
     this.aiMat.emissiveIntensity = pulse;
+
+    // --- Cosmetic particles (visual only; ordinary randomness is fine here) ---
+    // Spawn any queued bursts unless reduced motion is requested.
+    if (this.fxQueue.length) {
+      if (!env.reducedMotion) {
+        for (const fx of this.fxQueue) this.spawnBurst(fx.x, fx.y, fx.color, fx.count);
+      }
+      this.fxQueue.length = 0;
+    }
+    // Integrate + fade live sparks, releasing the dead ones back to the pool.
+    for (let i = this.sparks.length - 1; i >= 0; i--) {
+      const s = this.sparks[i];
+      s.life -= dt;
+      if (s.life <= 0) {
+        this.sparkPool.release(s);
+        this.sparks.splice(i, 1);
+        continue;
+      }
+      s.mesh.position.x += s.vx * dt;
+      s.mesh.position.y += s.vy * dt;
+      const t = s.life / s.maxLife;
+      s.mat.opacity = t;
+      s.mesh.scale.setScalar(0.4 + t * 0.6);
+    }
+  }
+
+  /** Spawn a small pooled spark burst (frame-only; never simulation). */
+  private spawnBurst(x: number, y: number, color: number, count: number): void {
+    for (let i = 0; i < count; i++) {
+      const s = this.sparkPool.acquire();
+      const a = Math.random() * Math.PI * 2;
+      const speed = 2 + Math.random() * 3;
+      s.vx = Math.cos(a) * speed;
+      s.vy = Math.sin(a) * speed;
+      s.maxLife = 0.32 + Math.random() * 0.18;
+      s.life = s.maxLife;
+      s.mat.color.setHex(color);
+      s.mat.opacity = 1;
+      s.mesh.position.set(x, y, 0.1);
+      s.mesh.scale.setScalar(1);
+      this.sparks.push(s);
+    }
   }
 
   resize(width: number, height: number): void {
@@ -340,11 +447,7 @@ class Rally implements Game {
   }
 
   dispose(): void {
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      mesh.geometry?.dispose();
-    });
-    this.scene.clear();
+    disposeScene(this.scene);
   }
 }
 

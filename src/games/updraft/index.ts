@@ -1,10 +1,11 @@
 import * as THREE from 'three';
 import type { Game, GameEnv, GameFactory } from '../../engine/types';
 import { neon, surface, emissive } from '../../art/materials';
-import { addLightRig, applyAtmosphere } from '../../art/lighting';
+import { addLightRig, applyAtmosphere, addGradientBackdrop } from '../../art/lighting';
 import { accents, palette } from '../../art/tokens';
 import { Pool } from '../../engine/pool';
 import { Rng } from '../../engine/rng';
+import { disposeScene } from '../../engine/dispose';
 
 const HALF_H = 5; // playfield half-height
 const GRAVITY = -18;
@@ -17,6 +18,7 @@ const DESPAWN_X = -17;
 const BIRD_R = 0.46;
 const GATE_HW = 0.7; // gate half-width in x
 const PILLAR_H = 14;
+const STAR_SPAN = 8; // parallax wrap span for the starfield (units in x)
 
 interface Gate {
   group: THREE.Group;
@@ -25,6 +27,13 @@ interface Gate {
   x: number;
   gapY: number;
   scored: boolean;
+}
+
+interface Shard {
+  mesh: THREE.Mesh;
+  vx: number;
+  vy: number;
+  life: number;
 }
 
 /** UPDRAFT — a flap-through-the-canyon game with real depth and lighting. */
@@ -40,6 +49,8 @@ class Updraft implements Game {
   private pool!: Pool<Gate>;
   private rungs: THREE.Mesh[] = [];
   private stars!: THREE.Points;
+  private shardPool!: Pool<Shard>;
+  private shards: Shard[] = [];
 
   private y = 0;
   private prevY = 0;
@@ -58,6 +69,8 @@ class Updraft implements Game {
 
   init(_env: GameEnv): void {
     addLightRig(this.scene, palette.cyan);
+    // Open canyon (no centre backplate) — keep the sky tint gentle.
+    addGradientBackdrop(this.scene, accents.updraft, 0.12);
 
     // Bird: glowing core + two flapping wings.
     const core = new THREE.Mesh(new THREE.IcosahedronGeometry(BIRD_R, 0), neon(accents.updraft, 1.1));
@@ -117,6 +130,20 @@ class Updraft implements Game {
       onAcquire: (g) => (g.group.visible = true),
       onRelease: (g) => (g.group.visible = false),
     });
+
+    // Shard pool for the death burst (visual only).
+    const shardGeo = new THREE.TetrahedronGeometry(0.14, 0);
+    const shardMat = neon(palette.cyan, 1.3);
+    this.shardPool = new Pool<Shard>({
+      create: () => {
+        const mesh = new THREE.Mesh(shardGeo, shardMat);
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return { mesh, vx: 0, vy: 0, life: 0 };
+      },
+      onAcquire: (s) => (s.mesh.visible = true),
+      onRelease: (s) => (s.mesh.visible = false),
+    });
   }
 
   private spawnGate(x: number): void {
@@ -133,6 +160,8 @@ class Updraft implements Game {
   reset(): void {
     for (const g of this.gates) this.pool.release(g);
     this.gates.length = 0;
+    for (const s of this.shards) this.shardPool.release(s);
+    this.shards.length = 0;
     this.y = 0;
     this.prevY = 0;
     this.vy = 0;
@@ -152,6 +181,7 @@ class Updraft implements Game {
       this.vy = FLAP_V;
       this.flapPulse = 1;
       env.audio.play('flap');
+      env.shake(0.04);
     }
 
     this.vy += GRAVITY * dt;
@@ -206,17 +236,35 @@ class Updraft implements Game {
       if (r.position.x < -19) r.position.x += 38.4;
     }
     this.stars.position.x -= SPEED * 0.18 * dt;
-    if (this.stars.position.x < -8) this.stars.position.x = 0;
+    // Smooth modulo wrap so the parallax never visibly jumps on long runs.
+    this.stars.position.x = ((this.stars.position.x % STAR_SPAN) + STAR_SPAN) % STAR_SPAN - STAR_SPAN;
   }
 
   private die(env: GameEnv): void {
     if (!this.alive) return;
     this.alive = false;
+    env.shake(0.3);
+    if (!env.reducedMotion) this.spawnDeathBurst();
     env.gameOver();
   }
 
-  frame(alpha: number, _env: GameEnv): void {
-    this.animT += 0.016;
+  /** Cyan shard burst at the bird on death. Visual only — ordinary randomness. */
+  private spawnDeathBurst(): void {
+    for (let i = 0; i < 10; i++) {
+      const s = this.shardPool.acquire();
+      const a = Math.random() * Math.PI * 2;
+      const speed = 2.5 + Math.random() * 4;
+      s.vx = Math.cos(a) * speed;
+      s.vy = Math.sin(a) * speed;
+      s.life = 0.5 + Math.random() * 0.35;
+      s.mesh.position.set(this.bird.position.x, this.y, 0);
+      s.mesh.scale.setScalar(1);
+      this.shards.push(s);
+    }
+  }
+
+  frame(alpha: number, env: GameEnv): void {
+    this.animT += env.dt;
     const y = this.prevY + (this.y - this.prevY) * alpha;
     this.bird.position.y = this.alive ? y : this.y;
     // Tilt with vertical velocity.
@@ -226,6 +274,23 @@ class Updraft implements Game {
     const beat = Math.sin(this.animT * 9) * 0.25 + this.flapPulse * 0.7;
     this.wingL.rotation.z = 0.4 + beat;
     this.wingR.rotation.z = -0.4 - beat;
+
+    // Advance death shards: drift, fade-by-scale, release when dead. Visual only.
+    for (let i = this.shards.length - 1; i >= 0; i--) {
+      const s = this.shards[i];
+      s.life -= env.dt;
+      if (s.life <= 0) {
+        this.shardPool.release(s);
+        this.shards.splice(i, 1);
+        continue;
+      }
+      s.mesh.position.x += s.vx * env.dt;
+      s.mesh.position.y += s.vy * env.dt;
+      s.vy += GRAVITY * 0.35 * env.dt;
+      s.mesh.scale.setScalar(THREE.MathUtils.clamp(s.life * 1.6, 0, 1));
+      s.mesh.rotation.x += env.dt * 6;
+      s.mesh.rotation.y += env.dt * 4;
+    }
   }
 
   resize(width: number, height: number): void {
@@ -241,11 +306,7 @@ class Updraft implements Game {
   }
 
   dispose(): void {
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      mesh.geometry?.dispose();
-    });
-    this.scene.clear();
+    disposeScene(this.scene);
   }
 }
 

@@ -15,7 +15,10 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "e2e": "playwright test",
-    "e2e:install": "playwright install --with-deps chromium"
+    "e2e:install": "playwright install --with-deps chromium",
+    "smoke:live": "node scripts/smoke-live.mjs",
+    "screens": "node scripts/capture.mjs",
+    "icons": "node scripts/gen-icons.mjs"
   },
   "dependencies": {
     "three": "0.184.0"

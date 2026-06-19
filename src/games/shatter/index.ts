@@ -1,8 +1,10 @@
 import * as THREE from 'three';
 import type { Game, GameEnv, GameFactory } from '../../engine/types';
 import { neon, surface, emissive } from '../../art/materials';
-import { addLightRig, applyAtmosphere } from '../../art/lighting';
+import { addLightRig, applyAtmosphere, addGradientBackdrop } from '../../art/lighting';
 import { accents, palette } from '../../art/tokens';
+import { Pool } from '../../engine/pool';
+import { disposeScene } from '../../engine/dispose';
 import { Rng } from '../../engine/rng';
 
 // --- Playfield geometry (world units, X horizontal, Y vertical) -----------
@@ -56,6 +58,15 @@ interface Brick {
   row: number;
 }
 
+/** A short-lived cosmetic shard from a shattered brick (visual only, not sim). */
+interface Shard {
+  mesh: THREE.Mesh;
+  vx: number;
+  vy: number;
+  life: number; // seconds remaining
+  ttl: number; // total lifetime (for fade)
+}
+
 /** SHATTER — 3D breakout: bounce a neon ball to shatter a wall of bricks. */
 class Shatter implements Game {
   readonly scene = new THREE.Scene();
@@ -69,6 +80,13 @@ class Shatter implements Game {
   private brickMeshes: THREE.Mesh[] = []; // one mesh per brick (reused across walls)
   private brickRowMats: THREE.MeshStandardMaterial[] = []; // one neon material per row
   private brickGeo!: THREE.BoxGeometry;
+
+  // Cosmetic shard particles (frame()-only; never read by the sim/E2E).
+  private shardGeo!: THREE.BoxGeometry;
+  private shardPool!: Pool<Shard>;
+  private shards: Shard[] = [];
+  /** Per-frame queue of brick breaks to emit a burst for (filled in update()). */
+  private breakBursts: { x: number; y: number; row: number }[] = [];
 
   // --- Simulation state (the test driver reads these) ---
   /** Ball centre in world units. */
@@ -97,6 +115,14 @@ class Shatter implements Game {
   private alive = true;
   private shimmerT = 0;
 
+  // Touch-launch bookkeeping: while stuck, a pointer-down aims the paddle; the
+  // ball only launches on the tap *release* (or a non-pointer fire edge). This
+  // lets a phone player reposition before serving. pointerWasDown tracks the
+  // down->up transition; pressAimX is the paddle x at press-time so we can tell
+  // a deliberate aim-drag from a quick serving tap.
+  private pointerWasDown = false;
+  private pressAimX = 0;
+
   constructor() {
     // Camera on +z, slight downward tilt for depth.
     this.camera = new THREE.PerspectiveCamera(52, 1, 0.1, 100);
@@ -107,6 +133,8 @@ class Shatter implements Game {
 
   init(_env: GameEnv): void {
     addLightRig(this.scene, palette.magenta);
+    // Tinted gradient sky so the neon sits in a volume, not a flat void.
+    addGradientBackdrop(this.scene, accents.shatter);
 
     // Back plate for depth — a dim matte slab behind the action.
     const back = new THREE.Mesh(
@@ -154,6 +182,23 @@ class Shatter implements Game {
       this.scene.add(m);
     }
 
+    // Shard particle pool: tiny self-lit cubes flung from a shattered brick.
+    // Pure cosmetic, lives in frame(); material is recolored per-burst.
+    this.shardGeo = new THREE.BoxGeometry(0.14, 0.14, 0.14);
+    this.shardPool = new Pool<Shard>({
+      create: () => {
+        const mesh = new THREE.Mesh(this.shardGeo, emissive(palette.ink));
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return { mesh, vx: 0, vy: 0, life: 0, ttl: 1 };
+      },
+      onAcquire: (s) => (s.mesh.visible = true),
+      onRelease: (s) => {
+        s.mesh.visible = false;
+        s.mesh.scale.setScalar(1);
+      },
+    });
+
     this.buildBricks();
     this.reset();
   }
@@ -183,6 +228,14 @@ class Shatter implements Game {
     this.alive = true;
     this.shimmerT = 0;
     this.paddleX = 0;
+    this.pointerWasDown = false;
+    this.pressAimX = 0;
+    // Retire any in-flight cosmetic shards from the prior run.
+    if (this.shardPool) {
+      for (const s of this.shards) this.shardPool.release(s);
+      this.shards.length = 0;
+      this.breakBursts.length = 0;
+    }
     if (this.brickMeshes.length) this.buildBricks();
     this.resetBall();
   }
@@ -215,20 +268,47 @@ class Shatter implements Game {
       this.paddleX = THREE.MathUtils.clamp(this.paddleX, -PADDLE_X_LIMIT, PADDLE_X_LIMIT);
     }
 
-    // --- Launch: while stuck the ball rides the paddle; any fire/tap/up frees it.
+    // --- Launch: while stuck the ball rides the paddle.
+    //
+    // Touch nuance: a pointer-down both grabs the paddle (aim) AND, via the
+    // input layer, raises a 'fire'/'flap'/'confirm' edge on the very same frame.
+    // If we launched on that edge a phone player could never reposition before
+    // serving. So while the pointer is held we only AIM; the serve happens on
+    // tap RELEASE (a quick tap with little aim movement). The keyboard /
+    // on-screen-button / E2E path never sets pointer.down, so a fire edge with
+    // pointer.down === false still launches immediately (the E2E depends on it).
     if (this.ballStuck) {
       this.ballPos.set(this.paddleX, PADDLE_Y + PADDLE_HH + BALL_R + 0.05, 0);
-      if (
+
+      const fireEdge =
         env.input.pressed('fire') ||
         env.input.pressed('flap') ||
         env.input.pressed('up') ||
-        env.input.pressed('confirm')
-      ) {
+        env.input.pressed('confirm');
+
+      const pointerDown = p.down;
+      let launch = false;
+
+      if (fireEdge && !pointerDown) {
+        // Keyboard / on-screen button / gamepad / E2E virtual fire.
+        launch = true;
+      } else if (this.pointerWasDown && !pointerDown) {
+        // Tap release: serve if the paddle barely moved since press (a tap, not
+        // a deliberate aim-drag), so dragging to aim never auto-serves.
+        if (Math.abs(this.paddleX - this.pressAimX) < 0.6) launch = true;
+      }
+
+      if (pointerDown && !this.pointerWasDown) this.pressAimX = this.paddleX; // press start
+      this.pointerWasDown = pointerDown;
+
+      if (launch) {
         this.ballStuck = false;
+        this.pointerWasDown = false;
         env.audio.play('bounce');
       }
       return;
     }
+    this.pointerWasDown = p.down;
 
     // --- Integrate ball.
     this.ballPos.x += this.ballVel.x * dt;
@@ -298,6 +378,12 @@ class Shatter implements Game {
       env.setScore(this.score);
       env.audio.play('break');
 
+      // Juice: a small camera tick + a shard burst in this brick's row colour.
+      // The shake self-guards on reducedMotion; particles are spawned in frame()
+      // and gated there, so we only record where the break happened.
+      env.shake(0.1);
+      this.breakBursts.push({ x: b.x, y: b.y, row: b.row });
+
       // Reflect off the shallower penetration axis.
       if (overlapX < overlapY) {
         this.ballVel.x = dx > 0 ? Math.abs(this.ballVel.x) : -Math.abs(this.ballVel.x);
@@ -326,6 +412,7 @@ class Shatter implements Game {
   private loseLife(env: GameEnv): void {
     this.lives--;
     env.audio.play('crash');
+    env.shake(0.25); // solid jolt on a dropped ball (no-op under reducedMotion)
     if (this.lives <= 0) {
       this.alive = false;
       env.gameOver();
@@ -334,7 +421,7 @@ class Shatter implements Game {
     this.resetBall();
   }
 
-  frame(alpha: number, _env: GameEnv): void {
+  frame(alpha: number, env: GameEnv): void {
     // Smooth the ball between fixed steps.
     if (this.ballStuck) {
       this.ball.position.set(this.paddleX, PADDLE_Y + PADDLE_HH + BALL_R + 0.05, 0);
@@ -345,9 +432,57 @@ class Shatter implements Game {
     this.paddle.position.x = this.paddleX;
 
     // Subtle brick shimmer via a gentle emissive pulse on the per-row materials.
-    this.shimmerT += 0.016;
+    // Driven by real elapsed time so the pulse rate is frame-rate independent.
+    this.shimmerT += env.dt;
     const pulse = 0.45 + Math.sin(this.shimmerT * 2.2) * 0.1;
     for (const m of this.brickRowMats) m.emissiveIntensity = pulse;
+
+    // Cosmetic shard bursts (visual only — ordinary randomness is fine here).
+    // Spawning is suppressed under reducedMotion; queued breaks are discarded so
+    // they don't pile up. Live shards still need to animate/clear.
+    if (env.reducedMotion) {
+      this.breakBursts.length = 0;
+    } else {
+      for (const b of this.breakBursts) this.spawnBurst(b.x, b.y, ROW_COLORS[b.row]);
+      this.breakBursts.length = 0;
+    }
+    this.updateShards(env.dt);
+  }
+
+  /** Fling ~6 colored shards out of a broken brick. Pooled; faded by life. */
+  private spawnBurst(x: number, y: number, color: number): void {
+    const n = 6;
+    for (let i = 0; i < n; i++) {
+      const s = this.shardPool.acquire();
+      const ang = Math.random() * Math.PI * 2;
+      const spd = 2 + Math.random() * 3;
+      s.vx = Math.cos(ang) * spd;
+      s.vy = Math.sin(ang) * spd + 1.5; // bias upward
+      s.ttl = 0.45 + Math.random() * 0.25;
+      s.life = s.ttl;
+      (s.mesh.material as THREE.MeshBasicMaterial).color.setHex(color);
+      s.mesh.position.set(x, y, 0.4);
+      s.mesh.scale.setScalar(1);
+      this.shards.push(s);
+    }
+  }
+
+  /** Integrate + fade live shards; release the dead ones back to the pool. */
+  private updateShards(dt: number): void {
+    for (let i = this.shards.length - 1; i >= 0; i--) {
+      const s = this.shards[i];
+      s.life -= dt;
+      if (s.life <= 0) {
+        this.shardPool.release(s);
+        this.shards.splice(i, 1);
+        continue;
+      }
+      s.vy -= 9 * dt; // gentle gravity for a settling arc
+      s.mesh.position.x += s.vx * dt;
+      s.mesh.position.y += s.vy * dt;
+      const t = s.life / s.ttl; // 1 -> 0
+      s.mesh.scale.setScalar(0.2 + t * 0.8);
+    }
   }
 
   resize(width: number, height: number): void {
@@ -369,12 +504,10 @@ class Shatter implements Game {
   }
 
   dispose(): void {
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      mesh.geometry?.dispose();
-    });
-    this.brickGeo?.dispose();
-    this.scene.clear();
+    // Frees geometry AND materials AND textures, then clears the scene. The
+    // shared brickGeo / shardGeo are reachable via their meshes in the scene
+    // graph, so disposeScene covers them too (no manual geo.dispose needed).
+    disposeScene(this.scene);
   }
 }
 

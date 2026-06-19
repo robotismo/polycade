@@ -1,6 +1,6 @@
 // Capture home + per-game screenshots into docs/ for the README.
 // Usage: node scripts/capture.mjs   (expects the dev server on :5173)
-import { chromium } from 'playwright';
+import { chromium } from '@playwright/test';
 import { mkdirSync } from 'node:fs';
 
 const BASE = process.env.BASE || 'http://localhost:5173';

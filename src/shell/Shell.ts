@@ -1,5 +1,7 @@
 import type { Game, GameMeta } from '../engine/types';
 import { Engine } from '../engine/engine';
+import type { EngineState } from '../engine/engine';
+import type { InputManager } from '../input/input';
 import { LocalScoreStore } from '../score/store';
 import type { ScoreStore } from '../score/store';
 import { loadSettings, saveSettings } from '../engine/settings';
@@ -10,6 +12,27 @@ import { el, clear } from './dom';
 import { hexToCss } from '../art/tokens';
 
 type View = 'home' | 'game';
+
+/** Stable inspection surface used by the Playwright E2E suite (and manual debug). */
+export interface PolycadeTestApi {
+  state(): EngineState;
+  score(): number;
+  best(id: string): number;
+  currentId(): string | null;
+  start(): void;
+  input: InputManager;
+  game(): Game | null;
+  tick(n: number): void;
+  stopLoop(): void;
+  startLoop(): void;
+  render(): void;
+}
+
+declare global {
+  interface Window {
+    polycade?: PolycadeTestApi;
+  }
+}
 
 /**
  * The DOM shell: tab navigation, home grid, HUD, overlays, settings and the
@@ -39,6 +62,7 @@ export class Shell {
   constructor(private root: HTMLElement) {
     this.buildSkeleton();
     this.engine = new Engine(this.canvas, this.settings.muted);
+    this.engine.setQuality(this.settings.reducedMotion);
     this.wireEngine();
     this.wireGlobal();
     this.onResize();
@@ -52,7 +76,7 @@ export class Shell {
    * Lets a driver read state/score and force input without scraping the canvas.
    */
   private exposeTestApi(): void {
-    (window as unknown as { polycade: unknown }).polycade = {
+    window.polycade = {
       state: () => this.engine.state,
       score: () => this.engine.getScore(),
       best: (id: string) => this.store.getBest(id),
@@ -90,6 +114,7 @@ export class Shell {
     this.homeEl = el('section', { class: 'home' });
 
     this.scoreEl = el('span', { class: 'score', html: '0' });
+    this.scoreEl.setAttribute('aria-label', 'Score');
     this.bestEl = el('span', { class: 'best', html: 'BEST 0' });
     const pauseBtn = el('button', { class: 'icon pause', html: '❚❚' });
     pauseBtn.type = 'button';
@@ -98,6 +123,8 @@ export class Shell {
 
     const hudTop = el('div', { class: 'hud-top' }, [this.scoreEl, this.bestEl, pauseBtn]);
     this.overlayEl = el('div', { class: 'overlay' });
+    this.overlayEl.setAttribute('role', 'dialog');
+    this.overlayEl.setAttribute('aria-live', 'polite');
     this.touchHost = el('div', { class: 'touch-host' });
     this.hudEl = el('div', { class: 'hud hidden' }, [hudTop, this.overlayEl, this.touchHost]);
 
@@ -119,6 +146,7 @@ export class Shell {
       const t = el('button', { class: 'tab', html: g.title });
       t.type = 'button';
       t.dataset.id = g.id;
+      t.setAttribute('aria-label', `Play ${g.title}`);
       t.style.setProperty('--accent', hexToCss(g.accent));
       t.addEventListener('click', () => this.go(`#/play/${g.id}`));
       this.tabsEl.append(t);
@@ -127,7 +155,10 @@ export class Shell {
 
   private setActiveTab(id: string): void {
     for (const t of Array.from(this.tabsEl.children) as HTMLElement[]) {
-      t.classList.toggle('active', (t.dataset.id ?? '') === id);
+      const active = (t.dataset.id ?? '') === id;
+      t.classList.toggle('active', active);
+      if (active) t.setAttribute('aria-current', 'page');
+      else t.removeAttribute('aria-current');
     }
   }
 
@@ -163,6 +194,9 @@ export class Shell {
   }
 
   private go(hash: string): void {
+    // Every nav click is a genuine user gesture — resume audio at the earliest
+    // tap (iOS needs the AudioContext unlocked inside a gesture handler).
+    this.engine.audio.unlock();
     if (location.hash === hash) this.route();
     else location.hash = hash;
   }
@@ -202,6 +236,10 @@ export class Shell {
       const best = this.store.getBest(g.id);
       const card = el('button', { class: 'card' });
       card.type = 'button';
+      card.setAttribute(
+        'aria-label',
+        `${g.title}. ${g.tagline}. ${best > 0 ? `Best score ${best}` : 'No score yet'}`,
+      );
       card.style.setProperty('--accent', hexToCss(g.accent));
       card.append(
         el('div', { class: 'card-glow' }),

@@ -50,6 +50,8 @@ Key decisions:
 - **One shared `WebGLRenderer`** owned by the shell; each game owns only its scene/camera and is disposed on tab switch, so the home → game → home loop never exhausts WebGL contexts.
 - **Deterministic fixed-timestep simulation** (`update(dt)` with constant `dt`, seeded RNG) — the same property that makes gameplay framerate-independent makes it unit-testable and lets headless E2E drive real input step-by-step.
 - **`ScoreStore` interface** in front of localStorage so a cloud leaderboard can drop in later without touching game code.
+- **Juice without breaking determinism** — camera shake, particle bursts and scale-pops live in the render layer (`frame()`), never the fixed-step simulation, so they add punch while the sim stays deterministic and unit-testable.
+- **Accessibility & reduced motion** — full keyboard focus rings, ARIA on the grid/tabs/score, restored pinch-zoom, and a `prefers-reduced-motion` path that also weakens bloom and caps pixel ratio (not just CSS). Installable PWA with a network-first service worker so a redeploy never strands a returning user on a stale shell.
 
 ## Develop
 

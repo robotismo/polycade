@@ -9,6 +9,11 @@ on:
 permissions:
   contents: read
 
+# Cancel superseded runs on the same ref so rapid pushes don't pile up.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   verify:
     runs-on: ubuntu-latest
@@ -55,9 +60,15 @@ jobs:
     permissions:
       pages: write
       id-token: write
+    # A Pages publish must not be cancelled mid-upload by a newer run.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+    outputs:
+      page_url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -67,8 +78,25 @@ jobs:
       - run: npm ci
       - run: npm run build
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: dist
       - id: deployment
         uses: actions/deploy-pages@v4
+
+  smoke:
+    # Post-deploy: boot the live URL and assert real gameplay + persistence.
+    needs: [deploy]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run smoke:live
+        env:
+          BASE: ${{ needs.deploy.outputs.page_url }}

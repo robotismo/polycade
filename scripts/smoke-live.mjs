@@ -1,8 +1,8 @@
 // Smoke-test the LIVE deployment: boot the app, play a game, assert scoring +
 // game-over + high-score persistence on the real URL.
-import { chromium } from 'playwright';
+import { chromium } from '@playwright/test';
 
-const BASE = process.env.BASE || 'https://robotismo.github.io/polycade';
+const BASE = (process.env.BASE || 'https://robotismo.github.io/polycade').replace(/\/$/, '');
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
 });

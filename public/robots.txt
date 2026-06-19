@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://robotismo.github.io/polycade/sitemap.xml

@@ -18,6 +18,26 @@ export function disposeObject(root: THREE.Object3D): void {
   root.parent?.remove(root);
 }
 
+/**
+ * Free every GPU resource a game's scene holds — geometry, materials, textures —
+ * then empty the scene. Games call this from dispose() so nothing leaks across
+ * the home -> game -> home loop. (Previously each game freed geometry only.)
+ */
+export function disposeScene(scene: THREE.Scene): void {
+  scene.traverse((obj) => {
+    const mesh = obj as THREE.Mesh;
+    if (mesh.geometry) mesh.geometry.dispose();
+    const mat = (mesh as THREE.Mesh).material;
+    if (mat) {
+      if (Array.isArray(mat)) mat.forEach(disposeMaterial);
+      else disposeMaterial(mat);
+    }
+  });
+  const bg = scene.background;
+  if (bg && (bg as THREE.Texture).isTexture) (bg as THREE.Texture).dispose();
+  scene.clear();
+}
+
 function disposeMaterial(material: THREE.Material): void {
   const m = material as unknown as Record<string, unknown>;
   for (const key of Object.keys(m)) {

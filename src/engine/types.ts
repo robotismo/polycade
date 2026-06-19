@@ -21,10 +21,17 @@ export interface GameEnv {
   height: number;
   /** True when the primary pointer is touch (mobile). */
   isTouch: boolean;
+  /** Real elapsed seconds for the current rendered frame — use in frame() for
+   *  frame-rate-independent cosmetic animation (NOT for simulation). */
+  dt: number;
+  /** True when the player prefers reduced motion — suppress shake/juice. */
+  reducedMotion: boolean;
   /** Report the current score; drives the live HUD. Idempotent. */
   setScore(score: number): void;
   /** End the current run. The shell shows the game-over overlay. */
   gameOver(): void;
+  /** Add camera-shake trauma [0,1] on an impact (auto-decays; no-op if reduced). */
+  shake(amount: number): void;
 }
 
 /**

@@ -73,6 +73,7 @@ export class InputManager implements InputState {
   private stepSwipe: SwipeDir | null = null;
 
   private padPrev = new Set<Action>();
+  private suppressPadEdges = false;
   private dragStart: { x: number; y: number; t: number } | null = null;
 
   private el!: HTMLElement;
@@ -115,6 +116,9 @@ export class InputManager implements InputState {
     this.pendingSwipe = null;
     this.stepSwipe = null;
     this.padPrev.clear();
+    // A button physically held across a reset (e.g. mashing restart) must not be
+    // re-detected as a fresh edge on the next poll.
+    this.suppressPadEdges = true;
     this.dragStart = null;
     this.pointer.down = false;
   }
@@ -250,6 +254,13 @@ export class InputManager implements InputState {
       if (ay < -0.4) now.add('up');
       if (ay > 0.4) now.add('down');
       if (now.has('up')) now.add('thrust');
+    }
+    // First poll after a reset: adopt the held buttons WITHOUT firing edges.
+    if (this.suppressPadEdges) {
+      for (const a of now) this.held.add(a);
+      this.padPrev = now;
+      this.suppressPadEdges = false;
+      return;
     }
     // Reconcile gamepad-held actions into the main held set with edges.
     for (const a of now) {

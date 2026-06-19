@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import type { Game, GameEnv, GameFactory } from '../../engine/types';
 import { neon, surface, emissive } from '../../art/materials';
-import { addLightRig, applyAtmosphere } from '../../art/lighting';
+import { addLightRig, applyAtmosphere, addGradientBackdrop } from '../../art/lighting';
 import { accents, palette } from '../../art/tokens';
 import { Pool } from '../../engine/pool';
+import { disposeScene } from '../../engine/dispose';
+import { wrap } from '../../engine/collision';
 import { Rng } from '../../engine/rng';
 
 // --- Field bounds (the X-Y plane). Objects wrap toroidally at the edges. -----
@@ -67,6 +69,18 @@ interface Asteroid {
   alive: boolean;
 }
 
+// --- Particles (VISUAL ONLY — live in frame(), never touch the simulation) ---
+const PARTICLE_LIFE = 0.55; // seconds
+interface Particle {
+  mesh: THREE.Mesh;
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  life: number; // remaining seconds
+  alive: boolean;
+}
+
 /** DRIFTFIELD — 3D Asteroids in a bounded, wrapping neon field. */
 class Driftfield implements Game {
   readonly scene = new THREE.Scene();
@@ -110,6 +124,14 @@ class Driftfield implements Game {
   private rockGeo!: THREE.IcosahedronGeometry;
   private stars!: THREE.Points;
 
+  // --- Cosmetic state (frame() only — never read by the simulation) ---------
+  private animT = 0; // dt-advanced clock for flame flicker / juice
+  private muzzleFlash = 0; // muzzle-flash intensity, decays in frame()
+  private noseRecoil = 0; // ship nose kickback, decays in frame()
+  private muzzle!: THREE.Mesh; // muzzle-flash sprite at the nose
+  private particles: Particle[] = [];
+  private particlePool!: Pool<Particle>;
+
   constructor() {
     this.camera = new THREE.PerspectiveCamera(55, 1, 0.1, 120);
     // Look down from +z with a slight tilt so the field reads top-down with depth.
@@ -120,6 +142,8 @@ class Driftfield implements Game {
 
   init(_env: GameEnv): void {
     addLightRig(this.scene, accents.driftfield);
+    // Tinted gradient sky so the field sits in a volume, not a flat void.
+    addGradientBackdrop(this.scene, accents.driftfield);
 
     // --- Ship: a low-poly arrowhead (cone) in neon yellow + a thrust flame ----
     const hullGeo = new THREE.ConeGeometry(0.55, 1.5, 3); // 3-sided => triangle prism
@@ -130,7 +154,11 @@ class Driftfield implements Game {
     this.flame.rotation.x = -Math.PI / 2; // point -y (out the back)
     this.flame.position.y = -0.95;
     this.flame.visible = false;
-    this.shipGroup.add(hull, core, this.flame);
+    // Muzzle flash: a small cyan flare at the nose, hidden until a shot.
+    this.muzzle = new THREE.Mesh(new THREE.IcosahedronGeometry(0.3, 0), emissive(palette.cyan));
+    this.muzzle.position.y = 0.85;
+    this.muzzle.visible = false;
+    this.shipGroup.add(hull, core, this.flame, this.muzzle);
     this.scene.add(this.shipGroup);
 
     // --- Field border frame (a thin neon rectangle around the bounds) ---------
@@ -205,14 +233,58 @@ class Driftfield implements Game {
       onAcquire: (b) => (b.mesh.visible = true),
       onRelease: (b) => (b.mesh.visible = false),
     });
+
+    // --- Particle pool (cosmetic shards for asteroid/ship bursts) ------------
+    // Per-particle material so each shard can fade its own opacity by life.
+    const shardGeo = new THREE.TetrahedronGeometry(0.16, 0);
+    this.particlePool = new Pool<Particle>({
+      create: () => {
+        const mat = new THREE.MeshBasicMaterial({ color: palette.yellow, transparent: true, opacity: 1 });
+        const mesh = new THREE.Mesh(shardGeo, mat);
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return { mesh, x: 0, y: 0, vx: 0, vy: 0, life: 0, alive: false };
+      },
+      onAcquire: (p) => (p.mesh.visible = true),
+      onRelease: (p) => (p.mesh.visible = false),
+    });
+  }
+
+  /**
+   * Spawn a small pooled burst at (x,y). VISUAL ONLY — called from event
+   * handlers that run inside the sim step but the particles themselves never
+   * feed back into the simulation, and they advance/fade in frame() via env.dt.
+   * Uses ordinary Math.random (cosmetic, never the seeded sim Rng).
+   */
+  private spawnBurst(x: number, y: number, color: number, count: number, speed: number): void {
+    for (let i = 0; i < count; i++) {
+      const p = this.particlePool.acquire();
+      const dir = Math.random() * Math.PI * 2;
+      const sp = speed * (0.5 + Math.random() * 0.8);
+      p.x = x;
+      p.y = y;
+      p.vx = Math.cos(dir) * sp;
+      p.vy = Math.sin(dir) * sp;
+      p.life = PARTICLE_LIFE * (0.7 + Math.random() * 0.5);
+      p.alive = true;
+      const mat = p.mesh.material as THREE.MeshBasicMaterial;
+      mat.color.setHex(color);
+      mat.opacity = 1;
+      const s = 0.6 + Math.random() * 0.7;
+      p.mesh.scale.setScalar(s);
+      p.mesh.position.set(x, y, 0.2);
+      this.particles.push(p);
+    }
   }
 
   reset(): void {
     // Recycle every live object back to its pool.
     for (const a of this.asteroids) this.pool.release(a);
     for (const b of this.bullets) this.bulletPool.release(b);
+    for (const p of this.particles) this.particlePool.release(p);
     this.asteroids.length = 0;
     this.bullets.length = 0;
+    this.particles.length = 0;
 
     this.ship.set(0, 0);
     this.shipPrev.set(0, 0);
@@ -230,6 +302,11 @@ class Driftfield implements Game {
     this.respawnTimer = 0;
     this.thrusting = false;
     this.flame.visible = false;
+    this.muzzle.visible = false;
+    this.muzzleFlash = 0;
+    this.noseRecoil = 0;
+    this.shipGroup.visible = true;
+    this.setShipOpacity(1); // clear any leftover respawn-blink fade
 
     this.spawnWave(this.wave);
   }
@@ -290,6 +367,9 @@ class Driftfield implements Game {
     b.mesh.position.set(b.x, b.y, 0);
     this.bullets.push(b);
     env.audio.play('shoot');
+    // Cosmetic kick: brief muzzle flash + tiny nose recoil (decay in frame()).
+    this.muzzleFlash = 1;
+    this.noseRecoil = 1;
   }
 
   /** Wrap a coordinate toroidally into [-half, half). */
@@ -380,8 +460,10 @@ class Driftfield implements Game {
       let hit = -1;
       for (let ai = 0; ai < this.asteroids.length; ai++) {
         const a = this.asteroids[ai];
-        const dx = a.x - b.x;
-        const dy = a.y - b.y;
+        // Field wraps toroidally — measure the SHORTEST (wrapped) delta so a
+        // bullet near one edge still hits a rock near the opposite edge.
+        const dx = wrap(a.x - b.x, BOUND_X);
+        const dy = wrap(a.y - b.y, BOUND_Y);
         const rr = a.r + BULLET_R;
         if (dx * dx + dy * dy <= rr * rr) {
           hit = ai;
@@ -404,8 +486,9 @@ class Driftfield implements Game {
     // --- Ship vs asteroid: lose a life (unless settling) ---------------------
     if (this.respawnTimer <= 0) {
       for (const a of this.asteroids) {
-        const dx = a.x - this.ship.x;
-        const dy = a.y - this.ship.y;
+        // Wrapped delta so the ship can't overlap a rock across the seam.
+        const dx = wrap(a.x - this.ship.x, BOUND_X);
+        const dy = wrap(a.y - this.ship.y, BOUND_Y);
         const rr = a.r + SHIP_R;
         if (dx * dx + dy * dy <= rr * rr) {
           this.loseLife(env);
@@ -440,10 +523,22 @@ class Driftfield implements Game {
       env.audio.play('explode');
     }
     this.pool.release(a);
+
+    // --- JUICE (visual only): tier-scaled shake + a hot shard burst ----------
+    const trauma = a.tier === 'large' ? 0.22 : a.tier === 'medium' ? 0.14 : 0.08;
+    env.shake(trauma);
+    if (!env.reducedMotion) {
+      // Warm yellow/orange shards scaled to how big the rock was.
+      const color = Math.random() < 0.5 ? palette.yellow : 0xff8a1f;
+      this.spawnBurst(a.x, a.y, color, 8, 2 + a.r * 1.6);
+    }
   }
 
   private loseLife(env: GameEnv): void {
     env.audio.play('crash');
+    // Crash impact: a solid shake + a magenta debris burst at the ship.
+    env.shake(0.3);
+    if (!env.reducedMotion) this.spawnBurst(this.ship.x, this.ship.y, palette.magenta, 10, 4);
     this.lives--;
     if (this.lives <= 0) {
       this.die(env);
@@ -464,17 +559,35 @@ class Driftfield implements Game {
     env.gameOver();
   }
 
-  frame(alpha: number, _env: GameEnv): void {
+  frame(alpha: number, env: GameEnv): void {
+    // dt-advanced cosmetic clock: drives flame flicker + juice decay so visuals
+    // are frame-rate independent (the simulation never reads this).
+    this.animT += env.dt;
+
     // --- Ship: interpolate position + angle, render facing -------------------
     const sx = this.shipPrev.x + (this.ship.x - this.shipPrev.x) * alpha;
     const sy = this.shipPrev.y + (this.ship.y - this.shipPrev.y) * alpha;
-    this.shipGroup.position.set(sx, sy, 0);
     const ang = this.shipAnglePrev + (this.shipAngle - this.shipAnglePrev) * alpha;
     this.shipGroup.rotation.z = ang;
-    // Flicker the flame while thrusting; blink the hull while settling.
+    // Tiny nose recoil: shove the hull backward along facing, easing out.
+    this.noseRecoil = Math.max(0, this.noseRecoil - env.dt * 6);
+    const kick = this.noseRecoil * 0.18;
+    this.shipGroup.position.set(sx + Math.sin(ang) * kick, sy - Math.cos(ang) * kick, 0);
+
+    // Flicker the flame while thrusting using the dt clock (not alpha).
     this.flame.visible = this.thrusting && this.alive;
-    if (this.flame.visible) this.flame.scale.y = 0.7 + Math.sin(alpha * 12 + sx) * 0.3;
-    this.shipGroup.visible = !(this.respawnTimer > 0 && Math.floor(this.respawnTimer * 12) % 2 === 0);
+    if (this.flame.visible) this.flame.scale.y = 0.7 + Math.sin(this.animT * 24) * 0.3;
+
+    // Muzzle flash: pop a cyan flare at the nose, fading by its own clock.
+    this.muzzleFlash = Math.max(0, this.muzzleFlash - env.dt * 7);
+    this.muzzle.visible = this.muzzleFlash > 0.01;
+    if (this.muzzle.visible) this.muzzle.scale.setScalar(0.4 + this.muzzleFlash * 0.9);
+
+    // Respawn blink: a smooth opacity fade in/out (gentler than a hard strobe,
+    // friendlier to photosensitivity).
+    this.shipGroup.visible = true;
+    const blink = this.respawnTimer > 0 ? 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(this.animT * 14)) : 1;
+    this.setShipOpacity(blink);
 
     // --- Asteroids: interpolate + spin ---------------------------------------
     for (const a of this.asteroids) {
@@ -490,6 +603,41 @@ class Driftfield implements Game {
       const by = b.py + (b.y - b.py) * alpha;
       b.mesh.position.set(bx, by, 0);
     }
+
+    // --- Particles: drift, fade + shrink by life, release when dead ----------
+    // Visual only — advanced by real dt, never feeds back into the simulation.
+    for (let i = this.particles.length - 1; i >= 0; i--) {
+      const p = this.particles[i];
+      p.life -= env.dt;
+      if (p.life <= 0) {
+        p.alive = false;
+        this.particlePool.release(p);
+        this.particles.splice(i, 1);
+        continue;
+      }
+      p.x += p.vx * env.dt;
+      p.y += p.vy * env.dt;
+      p.vx *= 0.94;
+      p.vy *= 0.94;
+      const t = p.life / PARTICLE_LIFE;
+      const mat = p.mesh.material as THREE.MeshBasicMaterial;
+      mat.opacity = Math.min(1, t);
+      p.mesh.scale.setScalar(0.4 + Math.min(1, t) * 0.7);
+      p.mesh.position.set(p.x, p.y, 0.2);
+      p.mesh.rotation.x += env.dt * 8;
+      p.mesh.rotation.y += env.dt * 6;
+    }
+  }
+
+  /** Set transparency on every ship-group material (respawn fade). */
+  private setShipOpacity(o: number): void {
+    this.shipGroup.traverse((obj) => {
+      const mat = (obj as THREE.Mesh).material as THREE.Material | undefined;
+      if (mat && 'opacity' in mat) {
+        mat.transparent = true;
+        (mat as THREE.Material & { opacity: number }).opacity = o;
+      }
+    });
   }
 
   resize(width: number, height: number): void {
@@ -508,11 +656,8 @@ class Driftfield implements Game {
   }
 
   dispose(): void {
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      mesh.geometry?.dispose();
-    });
-    this.scene.clear();
+    // Free geometry AND materials AND textures (was geometry-only — a GPU leak).
+    disposeScene(this.scene);
   }
 }
 

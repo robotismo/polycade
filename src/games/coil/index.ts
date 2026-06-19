@@ -1,9 +1,11 @@
 import * as THREE from 'three';
 import type { Game, GameEnv, GameFactory } from '../../engine/types';
 import type { SwipeDir } from '../../input/input';
-import { neon, surface, line } from '../../art/materials';
-import { addLightRig, applyAtmosphere } from '../../art/lighting';
+import { neon, surface, line, emissive } from '../../art/materials';
+import { addLightRig, applyAtmosphere, addGradientBackdrop } from '../../art/lighting';
 import { accents, palette } from '../../art/tokens';
+import { Pool } from '../../engine/pool';
+import { disposeScene } from '../../engine/dispose';
 import { Rng } from '../../engine/rng';
 
 /**
@@ -23,11 +25,23 @@ const MOVE_START = 0.16; // seconds per step at length START_LEN
 const MOVE_MIN = 0.085; // fastest step time (cap)
 const MOVE_RAMP = 0.004; // step time shaved per food eaten
 const SEG = 0.82; // segment cube size (world units)
+const HEAD_SCALE = 1.12; // resting head scale (body is 1)
+const POP_SCALE = 1.35; // peak head scale right after eating
 
 /** A grid cell. x,z are integer cell coords centered on the board. */
 interface Cell {
   x: number;
   z: number;
+}
+
+/** A pooled cosmetic particle shard (visual only — never simulation). */
+interface Shard {
+  mesh: THREE.Mesh;
+  vx: number;
+  vy: number;
+  vz: number;
+  life: number; // remaining seconds
+  ttl: number; // initial lifetime (for fade/scale)
 }
 
 /** Cardinal directions on the grid, matching the on-screen mapping. */
@@ -37,11 +51,6 @@ const DIRS: Record<SwipeDir, Cell> = {
   left: { x: -1, z: 0 },
   right: { x: 1, z: 0 },
 };
-
-/** Convert a grid cell to a world position (board centered at origin). */
-function cellToWorld(x: number, z: number): THREE.Vector3 {
-  return new THREE.Vector3(x * CELL, 0, z * CELL);
-}
 
 class Coil implements Game {
   readonly scene = new THREE.Scene();
@@ -66,7 +75,8 @@ class Coil implements Game {
   private growBy = 0; // segments still owed from recent food
   private score = 0;
   private alive = true;
-  private spinT = 0; // visual-only orb spin/bob clock
+  private spinT = 0; // visual-only orb spin/bob clock (advanced by env.dt)
+  private headPop = 0; // visual head-pop amount [0..1], decays in frame()
 
   // --- Render objects ---------------------------------------------------
   private segMeshes: THREE.Mesh[] = [];
@@ -74,7 +84,16 @@ class Coil implements Game {
   private segMat!: THREE.MeshStandardMaterial;
   private headMat!: THREE.MeshStandardMaterial;
   private foodMesh!: THREE.Mesh;
-  private prevWorld: THREE.Vector3[] = []; // each segment's world pos last step
+  // Flat world positions per segment (x,z packed) — no per-frame Vector3 churn.
+  private prevX: number[] = []; // each segment's world x at the previous step
+  private prevZ: number[] = []; // each segment's world z at the previous step
+  private targX: number[] = []; // each segment's world x at the current step
+  private targZ: number[] = []; // each segment's world z at the current step
+
+  // --- Cosmetic particles (visual only; pooled) -------------------------
+  private shardGeo!: THREE.BoxGeometry;
+  private shardPool!: Pool<Shard>;
+  private shards: Shard[] = [];
 
   constructor() {
     this.camera = new THREE.PerspectiveCamera(50, 1, 0.1, 120);
@@ -84,6 +103,9 @@ class Coil implements Game {
 
   init(_env: GameEnv): void {
     addLightRig(this.scene, palette.green);
+    // Coil's camera looks down onto the accent-heavy bottom of the backdrop, so
+    // use a gentle tint to keep the green-on-green snake readable.
+    addGradientBackdrop(this.scene, accents.coil, 0.1);
 
     const boardSize = GRID * CELL;
 
@@ -138,6 +160,21 @@ class Coil implements Game {
     this.foodMesh = new THREE.Mesh(new THREE.IcosahedronGeometry(0.42, 0), neon(palette.magenta, 1.3));
     this.scene.add(this.foodMesh);
 
+    // Pooled cosmetic shards for eat/death bursts. Each shard owns its own
+    // self-lit material so we can tint per burst (magenta = eat, green = death).
+    this.shardGeo = new THREE.BoxGeometry(0.16, 0.16, 0.16);
+    this.shardPool = new Pool<Shard>({
+      create: () => {
+        const mesh = new THREE.Mesh(this.shardGeo, emissive(palette.magenta));
+        mesh.visible = false;
+        this.scene.add(mesh);
+        return { mesh, vx: 0, vy: 0, vz: 0, life: 0, ttl: 0 };
+      },
+      onAcquire: (s) => (s.mesh.visible = true),
+      onRelease: (s) => (s.mesh.visible = false),
+      prefill: 16,
+    });
+
     this.reset();
   }
 
@@ -168,8 +205,7 @@ class Coil implements Game {
     if (empties.length === 0) return; // board full (win-ish); leave food as-is
     const pick = empties[this.rng.int(0, empties.length - 1)];
     this.food = { x: pick.x, z: pick.z };
-    this.foodMesh.position.copy(cellToWorld(this.food.x, this.food.z));
-    this.foodMesh.position.y = 0.1;
+    this.foodMesh.position.set(pick.x * CELL, 0.1, pick.z * CELL);
   }
 
   /** Grow/shrink the segment mesh pool to match the snake length. */
@@ -186,7 +222,7 @@ class Coil implements Game {
       if (used) {
         // Head gets the brighter material and a touch more presence.
         m.material = i === 0 ? this.headMat : this.segMat;
-        const s = i === 0 ? 1.12 : 1;
+        const s = i === 0 ? HEAD_SCALE : 1;
         m.scale.setScalar(s);
       }
     }
@@ -199,7 +235,12 @@ class Coil implements Game {
     this.moveInterval = MOVE_START;
     this.moveAccum = 0;
     this.prevAccum = 0;
+    this.headPop = 0;
     this.rng.seed(0x5e7e5e7);
+
+    // Retire any live cosmetic shards from the previous run.
+    for (const s of this.shards) this.shardPool.release(s);
+    this.shards.length = 0;
 
     // Snake of START_LEN cells along the center row, heading +x.
     // Head at the front of the array; body trails to -x.
@@ -244,7 +285,6 @@ class Coil implements Game {
     if (!this.alive) return;
 
     this.readInput(env);
-    this.spinT += dt;
 
     this.moveAccum += dt;
     while (this.moveAccum >= this.moveInterval) {
@@ -282,6 +322,9 @@ class Coil implements Game {
     this.snake.unshift(next);
     const ate = next.x === this.food.x && next.z === this.food.z;
     if (ate) {
+      // Capture the eaten cell before placeFood relocates the food.
+      const eatenX = this.food.x;
+      const eatenZ = this.food.z;
       this.score++;
       env.setScore(this.score);
       env.audio.play('eat');
@@ -289,6 +332,10 @@ class Coil implements Game {
       // Speed up a touch, down to the floor.
       this.moveInterval = Math.max(MOVE_MIN, MOVE_START - this.score * MOVE_RAMP);
       this.placeFood();
+      // JUICE (visual only — does not touch sim state): head pop, shake, burst.
+      this.headPop = 1;
+      env.shake(0.12);
+      if (!env.reducedMotion) this.spawnBurst(eatenX, eatenZ, palette.magenta, 8);
     }
     if (this.growBy > 0) {
       this.growBy--; // consume one owed growth: do not pop tail
@@ -304,33 +351,60 @@ class Coil implements Game {
     if (!this.alive) return;
     this.alive = false;
     env.audio.play('crash');
+    // JUICE (visual only): a solid shake + a green shard burst at the head.
+    env.shake(0.25);
+    const head = this.snake[0];
+    if (head && !env.reducedMotion) this.spawnBurst(head.x, head.z, palette.green, 10);
     env.gameOver();
   }
 
   // --- Position bookkeeping for smooth interpolation --------------------
 
-  /** Snapshot current world positions of all segments (pre-move). */
+  /** Snapshot current world positions of all segments (pre-move).
+   *  Writes into preallocated flat arrays — no Vector3 allocation. */
   private capturePrevWorld(): void {
-    this.prevWorld = this.snake.map((c) => cellToWorld(c.x, c.z));
+    for (let i = 0; i < this.snake.length; i++) {
+      const c = this.snake[i];
+      this.prevX[i] = c.x * CELL;
+      this.prevZ[i] = c.z * CELL;
+    }
+    this.prevX.length = this.snake.length;
+    this.prevZ.length = this.snake.length;
   }
 
-  /** Set each mesh to its target cell; this is the post-step rest position. */
+  /** Record each segment's target cell as flat world coords (interp target)
+   *  and place the meshes at rest there. No Vector3 allocation. */
   private snapTargets(): void {
     for (let i = 0; i < this.snake.length; i++) {
       const c = this.snake[i];
-      this.segMeshes[i].position.copy(cellToWorld(c.x, c.z));
+      const x = c.x * CELL;
+      const z = c.z * CELL;
+      this.targX[i] = x;
+      this.targZ[i] = z;
+      this.segMeshes[i].position.set(x, 0, z);
     }
+    this.targX.length = this.snake.length;
+    this.targZ.length = this.snake.length;
   }
 
-  /** Hard-place every mesh and seed the interp buffer (used on reset). */
+  /** Hard-place every mesh and seed the interp buffers (used on reset). */
   private snapWorld(): void {
-    this.prevWorld = this.snake.map((c) => cellToWorld(c.x, c.z));
     this.snapTargets();
+    for (let i = 0; i < this.snake.length; i++) {
+      this.prevX[i] = this.targX[i];
+      this.prevZ[i] = this.targZ[i];
+    }
+    this.prevX.length = this.snake.length;
+    this.prevZ.length = this.snake.length;
   }
 
   // --- Per-rendered-frame visual smoothing ------------------------------
 
-  frame(alpha: number, _env: GameEnv): void {
+  frame(alpha: number, env: GameEnv): void {
+    // Cosmetic clock advanced by real elapsed time so visuals stay frame-rate
+    // independent (replaces the old hardcoded 1/60 increment).
+    this.spinT += env.dt;
+
     // Interpolation across the current step: blend prev->target cell.
     // `alpha` from the shell covers the sub-step within the latest fixed dt;
     // we fold in banked time so motion stays continuous across multiple steps.
@@ -341,20 +415,72 @@ class Coil implements Game {
       if (t < 0) t = 0;
     }
 
+    // Write straight into mesh.position from flat scratch arrays — no Vector3
+    // allocation in this hot per-segment loop.
     for (let i = 0; i < this.snake.length; i++) {
-      const target = cellToWorld(this.snake[i].x, this.snake[i].z);
-      const prev = this.prevWorld[i] ?? target;
-      this.segMeshes[i].position.set(
-        prev.x + (target.x - prev.x) * t,
-        0,
-        prev.z + (target.z - prev.z) * t,
-      );
+      const tx = this.targX[i];
+      const tz = this.targZ[i];
+      const px = this.prevX[i] ?? tx;
+      const pz = this.prevZ[i] ?? tz;
+      this.segMeshes[i].position.set(px + (tx - px) * t, 0, pz + (tz - pz) * t);
+    }
+
+    // Head scale-pop on eat: ease the extra pop back to the resting head scale.
+    if (this.segMeshes.length > 0 && this.snake.length > 0) {
+      if (this.headPop > 0) {
+        this.headPop = Math.max(0, this.headPop - env.dt * 5);
+      }
+      const s = HEAD_SCALE + (POP_SCALE - HEAD_SCALE) * this.headPop;
+      this.segMeshes[0].scale.setScalar(s);
     }
 
     // Food orb: gentle bob + spin for life.
     this.foodMesh.rotation.y = this.spinT * 1.6;
     this.foodMesh.rotation.x = this.spinT * 1.1;
     this.foodMesh.position.y = 0.1 + Math.sin(this.spinT * 3) * 0.12;
+
+    // Advance + retire cosmetic shards (visual only; ordinary math, no sim).
+    this.updateShards(env.dt);
+  }
+
+  /** Spawn a small pooled burst of shards at a cell. Visual only — uses
+   *  ordinary randomness and never touches the seeded sim Rng. */
+  private spawnBurst(cellX: number, cellZ: number, color: number, count: number): void {
+    const x = cellX * CELL;
+    const z = cellZ * CELL;
+    for (let i = 0; i < count; i++) {
+      const s = this.shardPool.acquire();
+      this.shards.push(s);
+      (s.mesh.material as THREE.MeshBasicMaterial).color.setHex(color);
+      s.mesh.position.set(x, 0.2, z);
+      s.mesh.scale.setScalar(1);
+      const a = Math.random() * Math.PI * 2;
+      const sp = 1.6 + Math.random() * 2.4;
+      s.vx = Math.cos(a) * sp;
+      s.vz = Math.sin(a) * sp;
+      s.vy = 2.4 + Math.random() * 2.2;
+      s.ttl = 0.4 + Math.random() * 0.25;
+      s.life = s.ttl;
+    }
+  }
+
+  /** Integrate shards, fade/scale by remaining life, release the dead ones. */
+  private updateShards(dt: number): void {
+    for (let i = this.shards.length - 1; i >= 0; i--) {
+      const s = this.shards[i];
+      s.life -= dt;
+      if (s.life <= 0) {
+        this.shardPool.release(s);
+        this.shards.splice(i, 1);
+        continue;
+      }
+      s.vy -= 9 * dt; // gentle gravity
+      s.mesh.position.x += s.vx * dt;
+      s.mesh.position.y += s.vy * dt;
+      s.mesh.position.z += s.vz * dt;
+      const k = s.life / s.ttl;
+      s.mesh.scale.setScalar(k);
+    }
   }
 
   // --- Framing / lifecycle ----------------------------------------------
@@ -381,12 +507,9 @@ class Coil implements Game {
   }
 
   dispose(): void {
-    this.scene.traverse((obj) => {
-      const mesh = obj as THREE.Mesh;
-      mesh.geometry?.dispose();
-    });
-    this.scene.clear();
+    disposeScene(this.scene);
     this.segMeshes.length = 0;
+    this.shards.length = 0;
   }
 }
 

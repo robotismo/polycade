@@ -45,6 +45,9 @@ export class Engine {
   private rafId = 0;
   private width = 1;
   private height = 1;
+  private shakeTrauma = 0;
+  private reducedMotion = false;
+  private pixelCap = MAX_PIXEL_RATIO;
 
   constructor(canvas: HTMLCanvasElement, muted = false) {
     this.renderer = new THREE.WebGLRenderer({
@@ -69,8 +72,11 @@ export class Engine {
       width: this.width,
       height: this.height,
       isTouch: matchTouch(),
+      dt: FIXED_DT,
+      reducedMotion: false,
       setScore: (s: number) => this.setScore(s),
       gameOver: () => this.triggerGameOver(),
+      shake: (amount: number) => this.addShake(amount),
     };
   }
 
@@ -136,10 +142,6 @@ export class Engine {
     }
   }
 
-  restart(): void {
-    this.start();
-  }
-
   private setScore(s: number): void {
     if (s !== this.score) {
       this.score = s;
@@ -189,13 +191,41 @@ export class Engine {
   renderOnce(): void {
     if (!this.game) return;
     this.game.frame?.(0, this.env);
-    this.post.render();
+    this.renderScene();
+  }
+
+  /** Add camera-shake trauma [0,1] from a gameplay impact (decays each frame). */
+  addShake(amount: number): void {
+    if (this.reducedMotion) return;
+    this.shakeTrauma = Math.min(1, this.shakeTrauma + amount);
+  }
+
+  /** Render the active scene, applying a transient camera shake if any. */
+  private renderScene(): void {
+    const cam = this.game?.camera;
+    if (cam && this.shakeTrauma > 0 && !this.reducedMotion) {
+      const a = this.shakeTrauma * this.shakeTrauma;
+      const ox = (Math.random() * 2 - 1) * a * 0.6;
+      const oy = (Math.random() * 2 - 1) * a * 0.6;
+      const oz = (Math.random() * 2 - 1) * a * 0.05;
+      cam.position.x += ox;
+      cam.position.y += oy;
+      cam.rotation.z += oz;
+      this.post.render();
+      cam.position.x -= ox;
+      cam.position.y -= oy;
+      cam.rotation.z -= oz;
+    } else {
+      this.post.render();
+    }
   }
 
   private step(now: number): void {
     let dt = (now - this.last) / 1000;
     this.last = now;
     if (dt > 0.1) dt = 0.1; // clamp after tab-switch stalls
+    this.env.dt = dt; // real frame delta for cosmetic (frame-rate-independent) animation
+    if (this.shakeTrauma > 0) this.shakeTrauma = Math.max(0, this.shakeTrauma - dt * 1.8);
 
     this.input.beginFrame();
 
@@ -216,17 +246,28 @@ export class Engine {
         this.game.frame?.(0, this.env);
         if (
           (this._state === 'ready' || this._state === 'gameover' || this._state === 'paused') &&
+          !document.hidden &&
           (this.input.pressed('confirm') || this.input.pressed('flap'))
         ) {
           this.events.emit('confirm', undefined);
         }
         this.input.afterStep();
       }
-      this.post.render();
+      this.renderScene();
     } else {
       this.input.afterStep();
       this.renderer.render(this.placeholderScene, this.placeholderCamera);
     }
+  }
+
+  /** Apply quality/accessibility settings: reduced motion weakens bloom + DPR. */
+  setQuality(reducedMotion: boolean): void {
+    this.reducedMotion = reducedMotion;
+    this.env.reducedMotion = reducedMotion;
+    this.pixelCap = reducedMotion ? 1.5 : MAX_PIXEL_RATIO;
+    this.post.setReduced(reducedMotion);
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.pixelCap));
+    this.post.setSize(this.width, this.height, this.renderer.getPixelRatio());
   }
 
   // --- Sizing -----------------------------------------------------------
@@ -236,7 +277,7 @@ export class Engine {
     this.height = Math.max(1, Math.floor(height));
     this.env.width = this.width;
     this.env.height = this.height;
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
+    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, this.pixelCap));
     this.renderer.setSize(this.width, this.height, false);
     this.post.setSize(this.width, this.height, this.renderer.getPixelRatio());
     this.game?.resize(this.width, this.height);
