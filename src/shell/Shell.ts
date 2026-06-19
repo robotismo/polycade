@@ -61,6 +61,9 @@ export class Shell {
       input: this.engine.input,
       game: () => this.engine.current,
       tick: (n: number) => this.engine.advance(n ?? 1),
+      stopLoop: () => this.engine.stopLoop(),
+      startLoop: () => this.engine.startLoop(),
+      render: () => this.engine.renderOnce(),
     };
   }
 

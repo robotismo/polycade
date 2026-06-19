@@ -185,6 +185,13 @@ export class Engine {
     }
   }
 
+  /** Render a single frame on demand (used for headless screenshots). */
+  renderOnce(): void {
+    if (!this.game) return;
+    this.game.frame?.(0, this.env);
+    this.post.render();
+  }
+
   private step(now: number): void {
     let dt = (now - this.last) / 1000;
     this.last = now;
