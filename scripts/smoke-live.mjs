@@ -2,7 +2,7 @@
 // game-over + high-score persistence on the real URL.
 import { chromium } from '@playwright/test';
 
-const BASE = (process.env.BASE || 'https://robotismo.github.io/polycade').replace(/\/$/, '');
+const BASE = (process.env.BASE || 'https://paredes.dev/polycade').replace(/\/$/, '');
 const browser = await chromium.launch({
   args: ['--use-gl=angle', '--use-angle=swiftshader', '--enable-unsafe-swiftshader'],
 });

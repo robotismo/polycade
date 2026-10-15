@@ -4,7 +4,7 @@
 
 Five low-poly arcade classics, reimagined in 3D and rendered with [three.js](https://threejs.org). One cohesive neon-on-dark product, playable on desktop and phone, with high scores that persist across reloads. Every game ships as its own lazily-loaded tab, so you only download the cabinet you open.
 
-**▶ Live: https://robotismo.github.io/polycade/** — deploys to GitHub Pages via CI on every push to `main`.
+**▶ Live: https://paredes.dev/polycade/** — deploys to GitHub Pages via CI on every push to `main`.
 
 ![POLYCADE home](docs/home.png)
 
